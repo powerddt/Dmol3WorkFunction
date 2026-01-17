@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+DMol3 Work Function post-processing  - Robust vacuum detection
+
+Auther: powerddt (powerddt@163.com)
+https://github.com/powerddt
+
+This script post-processes DMol3 electrostatic potential grid (*.grd) and outmol (*.outmol)
+to compute the work function and generate Materials Studio (MS)-like work-function plots.
+
+Key behaviors (to match Materials Studio WF plots):
+1) FORCE SIGN FLIP: V_plot(z) = - V_grd(z)
+   (This matches MS plotting convention where vacuum plateau is the highest and near 0 eV after shifting.)
+2) Auto-detect vacuum plateau globally and SHIFT it to 0 eV in the plot.
+3) Plot fractional coordinate with PERIODIC EXTENSION so x-range like 0.1–1.1 still shows
+   data in 1.0–1.1 (MS-like periodic wrap).
+4) Robust Fermi parser for outmol line, e.g.:
+   "Fermi Energy:  -0.13214 Ha  -3.596 eV   -kTS_e=..."
+
+Outputs:
+- <prefix>_Vz.csv        : z_A, fractional_z, V_plot_eV(=-Vgrd), V_shift_eV(vac=0)
+- <prefix>_Vz_raw.png    : V(z) vs z (after sign flip, before vacuum shift)
+- <prefix>_WF_style.png  : MS-like WF figure (fractional axis, vacuum=0, fermi, Phi arrow)
+
+------------------------------------------------------------------------------
+Command-line arguments (all optional unless marked REQUIRED)
+------------------------------------------------------------------------------
+
+REQUIRED inputs:
+  --grd PATH
+      DMol3 electrostatic potential grid (*.grd). Large text files are supported via streaming.
+  --outmol PATH
+      DMol3 outmol file (*.outmol) used to parse Fermi energy.
+
+Main output control:
+  --prefix STR
+      Output file prefix. Default: "WF"
+  --xlim XMIN XMAX
+      X-axis limits in fractional coordinate (z/c). Default: 0.10 1.10
+      NOTE: If XMAX > 1 (e.g., 1.10), the script automatically appends one extra period so
+            the curve appears in 1.0–1.1 like Materials Studio.
+
+Fermi energy:
+  --ef-ev EF
+      Manually override Fermi energy in eV (skip parsing from outmol). Useful for debugging.
+
+GRD data order / memory:
+  --order {xyz,xzy,yxz,yzx,zxy,zyx}
+      Storage order of grid values in the .grd file. Default: xyz
+      If the curve looks wrong, try a different order.
+  --chunk-mb N
+      Streaming chunk size (MB) for reading huge .grd text file. Default: 16
+      Use smaller values (e.g., 8) if memory is tight.
+
+Vacuum plateau detection (automatic):
+  --prefer-frac F0 F1
+      Preferred fractional range where vacuum plateau is expected. Default: 0.25 0.95
+      Candidate windows are scored by overlap with this range, length, and flatness (std).
+  --smooth-w N
+      Smoothing window (points) applied before computing dV/dz for flatness. Default: 17
+      Increase (e.g., 31–61) for noisy curves.
+  --slope-percentile P
+      Flatness threshold: points with |dV/dz| <= percentile(P) are treated as "flat candidates".
+      Default: 30. Increase (e.g., 60–90) if plateau is not detected (COF-like cases).
+  --min-points N
+      Minimum number of points for a plateau window. Default: 8
+  --gap-max N
+      Merge flat segments separated by <= N points. Default: 2
+
+Robustness knobs (rarely need to change):
+  --vac-mean-tol T
+      Keep "vacuum-like" windows whose mean is within T eV of the maximum-mean flat window.
+      Default: 0.50 eV
+  --fallback-win N
+      If plateau segments cannot be detected, use a sliding-window fallback with N points.
+      Default: 15
+
+------------------------------------------------------------------------------
+Typical examples
+------------------------------------------------------------------------------
+
+1) Standard run (MS-like 0.1–1.1 axis):
+  python dmol3_wf_stream_style_final.py --grd NCS.grd --outmol NCS.outmol --prefix NCS
+
+2) Adjust x-axis range (still periodic if xmax > 1):
+  python dmol3_wf_stream_style_final.py --grd NCS.grd --outmol NCS.outmol --prefix NCS --xlim -0.1 1.2
+
+3) COF-like cases (plateau harder to detect) - smooth more and loosen flatness:
+  python dmol3_wf_stream_style_final.py --grd COF-WF_potential.grd --outmol COF-WF.outmol --prefix COF --smooth-w 41 --slope-percentile 80
+
+4) Override EF manually:
+  python dmol3_wf_stream_style_final.py --grd XXX.grd --outmol XXX.outmol --prefix XXX --ef-ev -3.596
+
+------------------------------------------------------------------------------
+Notes / interpretation
+------------------------------------------------------------------------------
+
+- Work function definition:
+    Phi = V_vac - E_F
+  where V_vac is the mean vacuum plateau potential (from planar-averaged V(z)),
+  and E_F is parsed from outmol (in eV).
+- The plot is shifted so that vacuum plateau = 0 eV:
+    V'(z) = V(z) - V_vac
+    E_F'  = E_F  - V_vac  (typically negative in the plot)
+  This visualization shift does NOT change Phi.
+"""
+
+
+import argparse
+import re
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+HA2EV = 27.211386245988
+
+
+# -----------------------------
+# Parse GRD header
+# -----------------------------
+def read_grd_header(grd_path: Path):
+    """
+    DMol3 .grd (text) header:
+      1 title
+      2 format
+      3 a b c alpha beta gamma
+      4 nx ny nz   (interval counts)
+      5 index ranges
+      6+ data
+    """
+    with grd_path.open("rt", errors="ignore") as f:
+        _ = f.readline()
+        _ = f.readline()
+        l3 = f.readline()
+        l4 = f.readline()
+        _ = f.readline()
+
+    a, b, c = map(float, l3.split()[:3])
+    nx_int, ny_int, nz_int = map(int, l4.split()[:3])
+    data_start_line = 5
+    return a, b, c, nx_int, ny_int, nz_int, data_start_line
+
+
+# -----------------------------
+# Parse Fermi energy
+# -----------------------------
+def parse_fermi_from_outmol(outmol_path: Path):
+    txt = outmol_path.read_text(errors="ignore")
+    txt = re.sub(r"([0-9])D([+\-]?[0-9]+)", r"\1E\2", txt, flags=re.IGNORECASE)
+
+    pat = re.compile(
+        r"fermi\s+energy\s*[:=]?\s*"
+        r"([+\-]?\d+(?:\.\d+)?(?:[Ee][+\-]?\d+)?)\s*Ha\s+"
+        r"([+\-]?\d+(?:\.\d+)?(?:[Ee][+\-]?\d+)?)\s*eV",
+        flags=re.IGNORECASE,
+    )
+    m = pat.search(txt)
+    if not m:
+        raise RuntimeError("Cannot find 'Fermi Energy' in outmol. Use --ef-ev to override.")
+    return float(m.group(1)), float(m.group(2))
+
+
+# -----------------------------
+# Streaming float reader
+# -----------------------------
+def iter_floats_stream(f, chunk_size_bytes=16 * 1024 * 1024):
+    tail = ""
+    while True:
+        chunk = f.read(chunk_size_bytes)
+        if not chunk:
+            break
+        chunk = tail + chunk
+        last_ws = max(chunk.rfind(" "), chunk.rfind("\n"), chunk.rfind("\t"), chunk.rfind("\r"))
+        if last_ws == -1:
+            tail = chunk
+            continue
+        body = chunk[:last_ws]
+        tail = chunk[last_ws:]
+        arr = np.fromstring(body, sep=" ")
+        if arr.size:
+            yield arr
+    if tail.strip():
+        arr = np.fromstring(tail, sep=" ")
+        if arr.size:
+            yield arr
+
+
+def build_strides(Nx, Ny, Nz, order="xyz"):
+    order = order.lower().strip()
+    if len(order) != 3 or sorted(order) != ["x", "y", "z"]:
+        raise ValueError("order must be a permutation of xyz, e.g., xyz/xzy/zxy.")
+    sizes = {"x": Nx, "y": Ny, "z": Nz}
+    stride = 1
+    strides = {}
+    for ax in order:
+        strides[ax] = stride
+        stride *= sizes[ax]
+    return strides, stride
+
+
+def planar_avg_vz_from_grd_stream(grd_path: Path, Nx, Ny, Nz, data_start_line, order="xyz", chunk_mb=16):
+    strides, total = build_strides(Nx, Ny, Nz, order=order)
+    stride_z = strides["z"]
+
+    sums = np.zeros(Nz, dtype=np.float64)
+    counts = np.zeros(Nz, dtype=np.int64)
+
+    idx0 = 0
+    chunk_size_bytes = int(chunk_mb * 1024 * 1024)
+
+    with grd_path.open("rt", errors="ignore") as f:
+        for _ in range(data_start_line):
+            _ = f.readline()
+
+        for block in iter_floats_stream(f, chunk_size_bytes=chunk_size_bytes):
+            if idx0 >= total:
+                break
+            remain = total - idx0
+            if block.size > remain:
+                block = block[:remain]
+
+            n = block.size
+            idxs = np.arange(idx0, idx0 + n, dtype=np.int64)
+            iz = ((idxs // stride_z) % Nz).astype(np.int64)
+
+            sums += np.bincount(iz, weights=block, minlength=Nz)
+            counts += np.bincount(iz, minlength=Nz)
+            idx0 += n
+
+    if idx0 != total:
+        raise RuntimeError(f"Read {idx0} values but expected {total}. File may be truncated or format differs.")
+
+    return sums / counts
+
+
+# -----------------------------
+# Vacuum plateau detection (global, robust)
+# -----------------------------
+def moving_average(y, w=17):
+    w = max(1, int(w))
+    if w == 1:
+        return y.copy()
+    k = np.ones(w) / w
+    return np.convolve(y, k, mode="same")
+
+
+def contiguous_segments(mask: np.ndarray):
+    segs = []
+    n = mask.size
+    i = 0
+    while i < n:
+        if mask[i]:
+            j = i
+            while j + 1 < n and mask[j + 1]:
+                j += 1
+            segs.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+    return segs
+
+
+def merge_close_segments(segs, gap_max=2):
+    """Merge segments separated by <= gap_max points."""
+    if not segs:
+        return []
+    segs = sorted(segs)
+    merged = [list(segs[0])]
+    for a, b in segs[1:]:
+        if a - merged[-1][1] - 1 <= gap_max:
+            merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    return [(x[0], x[1]) for x in merged]
+
+
+def sliding_window_fallback(z, v_ev, win_pts=15):
+    """
+    Fallback when flat-segment detection fails:
+    find the flattest sliding window; among the flattest, pick highest mean.
+    Returns a list with one window dict.
+    """
+    n = len(v_ev)
+    win_pts = max(5, min(int(win_pts), n))
+    x = v_ev
+
+    k = np.ones(win_pts)
+    s1 = np.convolve(x, k, mode="same")
+    s2 = np.convolve(x * x, k, mode="same")
+    m = s1 / win_pts
+    var = np.maximum(s2 / win_pts - m * m, 0.0)
+    std = np.sqrt(var)
+
+    margin = win_pts // 2
+    valid = np.zeros(n, dtype=bool)
+    valid[margin:n - margin] = True
+
+    idx_valid = np.where(valid)[0]
+    std_v = std[valid]
+    thr_std = float(np.percentile(std_v, 10.0))  # flattest 10%
+    cand = idx_valid[std_v <= thr_std]
+    if cand.size == 0:
+        cand = idx_valid
+
+    best = max(cand, key=lambda i: (m[i], -std[i]))
+    i0 = max(0, best - margin)
+    i1 = min(n - 1, best + margin)
+
+    vv = v_ev[i0:i1 + 1]
+    return [{
+        "i0": int(i0), "i1": int(i1), "n": int(i1 - i0 + 1),
+        "z0": float(z[i0]), "z1": float(z[i1]),
+        "f0": float(z[i0] / z[-1]), "f1": float(z[i1] / z[-1]),
+        "mean": float(vv.mean()),
+        "std": float(vv.std(ddof=0)),
+        "_fallback": True
+    }]
+
+
+def detect_vacuum_windows(
+    z,
+    v_ev,
+    smooth_w=17,
+    slope_percentile=30.0,
+    min_points=8,
+    gap_max=2,
+    vac_mean_tol=0.50,
+    fallback_win=15,
+):
+    """
+    Robust approach:
+      1) Smooth V -> v_s
+      2) Compute |dV/dz|
+      3) Flat mask: dv <= percentile
+      4) Build contiguous flat segments -> windows
+      5) Keep "vacuum-like" windows as those with mean within vac_mean_tol of max mean
+      6) If no windows, fallback to sliding-window method (always returns one window)
+    """
+    v_s = moving_average(v_ev, smooth_w)
+    dv = np.abs(np.gradient(v_s, z))
+
+    thr_dv = float(np.percentile(dv, slope_percentile))
+    flat = dv <= max(thr_dv, 1e-12)
+
+    if flat.sum() < min_points:
+        # fallback: take flattest 25% points as "flat"
+        k = max(min_points, int(0.25 * len(z)))
+        idx = np.argsort(dv)[:k]
+        flat = np.zeros_like(flat, dtype=bool)
+        flat[idx] = True
+
+    segs = merge_close_segments(contiguous_segments(flat), gap_max=gap_max)
+
+    windows = []
+    for i0, i1 in segs:
+        nseg = i1 - i0 + 1
+        if nseg < min_points:
+            continue
+        vv = v_ev[i0:i1 + 1]
+        windows.append({
+            "i0": int(i0), "i1": int(i1), "n": int(nseg),
+            "z0": float(z[i0]), "z1": float(z[i1]),
+            "f0": float(z[i0] / z[-1]), "f1": float(z[i1] / z[-1]),
+            "mean": float(vv.mean()),
+            "std": float(vv.std(ddof=0)),
+        })
+
+    if not windows:
+        return sliding_window_fallback(z, v_ev, win_pts=fallback_win)
+
+    # choose vacuum-like group near highest mean among flat windows
+    mmax = max(w["mean"] for w in windows)
+    vac_like = [w for w in windows if w["mean"] >= (mmax - vac_mean_tol)]
+    if not vac_like:
+        vac_like = windows
+
+    # sort: longer, higher mean, flatter
+    vac_like.sort(key=lambda w: (w["n"], w["mean"], -w["std"]), reverse=True)
+    return vac_like
+
+
+def overlap_len(f0, f1, a, b):
+    left = max(f0, a)
+    right = min(f1, b)
+    return max(0.0, right - left)
+
+
+def choose_reference_window(windows, ef_ev, prefer_frac=(0.25, 0.95), w_overlap=50.0, w_std=40.0):
+    """
+    Score windows:
+      score = w_overlap * overlap_with_prefer + n_points - w_std * std
+    If no window overlaps prefer range, drop overlap term and choose best by (n - w_std*std).
+    """
+    if not windows:
+        raise RuntimeError("No vacuum plateau windows found (unexpected).")
+
+    a, b = prefer_frac
+    scores = []
+    for w in windows:
+        ov = overlap_len(w["f0"], w["f1"], a, b)
+        s = w_overlap * ov + w["n"] - w_std * w["std"]
+        scores.append((s, ov, w))
+
+    has_ov = any(ov > 0 for (_, ov, _) in scores)
+    if has_ov:
+        best = max(scores, key=lambda t: t[0])[2]
+    else:
+        best = max(windows, key=lambda w: (w["n"] - w_std * w["std"], w["mean"]))
+
+    best["phi"] = best["mean"] - ef_ev
+    return best
+
+
+# -----------------------------
+# Plot helpers
+# -----------------------------
+def style_like_example(ax):
+    for s in ax.spines.values():
+        s.set_linewidth(2.8)
+    ax.tick_params(width=2.6, length=6, labelsize=12)
+    ax.xaxis.label.set_size(14)
+    ax.yaxis.label.set_size(14)
+
+
+def periodic_extend(frac, y, xlim):
+    """
+    Extend (frac in [0,1]) to include [1, 1+delta] etc, similar to MS.
+    If xlim[1] > 1, append one more period.
+    If xlim[0] < 0, prepend one period.
+    """
+    xmin, xmax = xlim
+    xs = [frac.copy()]
+    ys = [y.copy()]
+
+    if xmax > 1.0:
+        xs.append(frac + 1.0)
+        ys.append(y.copy())
+    if xmin < 0.0:
+        xs.insert(0, frac - 1.0)
+        ys.insert(0, y.copy())
+
+    x = np.concatenate(xs)
+    yy = np.concatenate(ys)
+    return x, yy
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    ap = argparse.ArgumentParser(description="DMol3 WF (MS-consistent): flip sign, auto vacuum=0, plot 0.1–1.1.")
+    ap.add_argument("--grd", required=True, help="*.grd file (DMol3 electrostatic potential)")
+    ap.add_argument("--outmol", required=True, help="*.outmol file (for Fermi energy)")
+    ap.add_argument("--prefix", default="WF", help="Output prefix")
+
+    ap.add_argument("--order", default="xyz", help="Data order (default xyz). If wrong, try xzy/zxy/...")
+    ap.add_argument("--chunk-mb", type=int, default=16, help="Streaming chunk MB (default 16; use 8 if memory tight)")
+
+    ap.add_argument("--ef-ev", type=float, default=None, help="Override EF in eV (optional)")
+
+    # MS-like axis: show 0.1–1.1 by default
+    ap.add_argument("--xlim", nargs=2, type=float, default=[0.10, 1.10], help="x-axis limits in fractional coord")
+
+    # Vacuum detection + preference range
+    ap.add_argument("--prefer-frac", nargs=2, type=float, default=[0.25, 0.95],
+                    help="Preferred vacuum plateau fractional range (default 0.25 0.95)")
+    ap.add_argument("--smooth-w", type=int, default=17, help="Smoothing window (default 17)")
+    ap.add_argument("--slope-percentile", type=float, default=30.0, help="Flatness percentile (default 30)")
+    ap.add_argument("--min-points", type=int, default=8, help="Min points for a plateau window (default 8)")
+    ap.add_argument("--gap-max", type=int, default=2, help="Merge segments separated by <= gap points (default 2)")
+
+    # Robustness knobs (kept internal defaults; still exposed if needed)
+    ap.add_argument("--vac-mean-tol", type=float, default=0.50, help="Vac windows: mean within tol of max-mean (eV)")
+    ap.add_argument("--fallback-win", type=int, default=15, help="Fallback sliding window points (default 15)")
+
+    args = ap.parse_args()
+
+    grd = Path(args.grd)
+    outmol = Path(args.outmol)
+
+    a, b, c, nx_int, ny_int, nz_int, data_start = read_grd_header(grd)
+    Nx, Ny, Nz = nx_int + 1, ny_int + 1, nz_int + 1
+
+    if args.ef_ev is None:
+        _, ef_ev = parse_fermi_from_outmol(outmol)
+    else:
+        ef_ev = float(args.ef_ev)
+
+    # z grid
+    z = np.linspace(0.0, c, Nz)
+    frac = z / c
+
+    # read planar average (Ha/e) -> eV
+    vz_ha = planar_avg_vz_from_grd_stream(
+        grd, Nx, Ny, Nz, data_start_line=data_start, order=args.order, chunk_mb=args.chunk_mb
+    )
+    vz_ev = vz_ha * HA2EV
+
+    # IMPORTANT: match Materials Studio -> FORCE sign flip
+    v_plot = -vz_ev
+
+    # detect vacuum windows (robust)
+    windows = detect_vacuum_windows(
+        z, v_plot,
+        smooth_w=args.smooth_w,
+        slope_percentile=args.slope_percentile,
+        min_points=args.min_points,
+        gap_max=args.gap_max,
+        vac_mean_tol=args.vac_mean_tol,
+        fallback_win=args.fallback_win,
+    )
+
+    ref = choose_reference_window(
+        windows, ef_ev,
+        prefer_frac=tuple(args.prefer_frac),
+        w_overlap=50.0,
+        w_std=40.0
+    )
+    vvac = ref["mean"]
+    phi = vvac - ef_ev
+
+    # shift so vacuum = 0
+    v_shift = v_plot - vvac
+    ef_shift = ef_ev - vvac  # should be -Phi
+
+    # ---- print summary ----
+    print("=== Parsed ===")
+    print(f"Cell c={c:.3f} Å, grid Nx,Ny,Nz={Nx},{Ny},{Nz}, order={args.order}")
+    print(f"E_F = {ef_ev:.3f} eV")
+    print("FORCED sign: V_plot = -V_grd")
+
+    if windows and windows[0].get("_fallback", False):
+        print("\n[WARN] Vacuum detection fell back to sliding-window method (plateau may be weak/noisy).")
+
+    print("\n=== Vacuum-window candidates (top 6) ===")
+    for i, w in enumerate(windows[:6], 1):
+        wphi = w["mean"] - ef_ev
+        tag = " (fallback)" if w.get("_fallback", False) else ""
+        print(f"[{i}] f={w['f0']:.3f}–{w['f1']:.3f}  Vmean={w['mean']:.3f} eV std={w['std']:.3f} n={w['n']} -> Φ={wphi:.3f} eV{tag}")
+
+    print("\n=== Reference vacuum (used to set 0 eV in plot) ===")
+    print(f"ref f={ref['f0']:.3f}–{ref['f1']:.3f} (preferred {args.prefer_frac[0]}–{args.prefer_frac[1]})")
+    print(f"Vvac(ref)={vvac:.3f} eV  -> Work function Φ={phi:.3f} eV")
+
+    # ---- save CSV ----
+    out_csv = Path(f"{args.prefix}_Vz.csv")
+    np.savetxt(
+        out_csv,
+        np.column_stack([z, frac, v_plot, v_shift]),
+        delimiter=",",
+        header="z_A,fractional_z,V_plot_eV(=-Vgrd),V_shift_eV(vac=0)",
+        comments=""
+    )
+    print(f"\n[OK] Wrote: {out_csv.resolve()}")
+
+    # ---- raw plot vs z ----
+    fig_raw = plt.figure(figsize=(6.4, 4.8))
+    axr = fig_raw.add_subplot(111)
+    axr.plot(z, v_plot, linewidth=2.2)
+    axr.set_xlabel("z (Å)")
+    axr.set_ylabel("Planar-averaged electrostatic potential (eV)")
+    style_like_example(axr)
+    fig_raw.tight_layout()
+    raw_png = Path(f"{args.prefix}_Vz_raw.png")
+    fig_raw.savefig(raw_png, dpi=300)
+    print(f"[OK] Wrote: {raw_png.resolve()}")
+
+    # ---- MS-like WF plot (fractional, periodic extension) ----
+    xlim = (float(args.xlim[0]), float(args.xlim[1]))
+    x_ext, v_ext = periodic_extend(frac, v_shift, xlim)
+
+    fig = plt.figure(figsize=(6.8, 5.0))
+    ax = fig.add_subplot(111)
+    ax.plot(x_ext, v_ext, linewidth=2.8)
+
+    ax.set_xlabel("Fractional coordinate")
+    ax.set_ylabel("Electrostatic potential (eV)")
+    ax.set_xlim(*xlim)
+
+    # vacuum and fermi lines
+    ax.axhline(0.0, linestyle="--", linewidth=2.2, color="#2ca02c")
+    ax.axhline(ef_shift, linestyle="--", linewidth=2.2, color="#d62728")
+
+    ax.text(xlim[0] + 0.18, 0.35, "Vacuum Level", fontsize=14, color="#2ca02c")
+    ax.text(xlim[0] + 0.18, ef_shift - 0.55, "Fermi Level", fontsize=14, color="#d62728")
+
+    # arrow in the middle of reference window (choose a visible x)
+    xmid = 0.5 * (ref["f0"] + ref["f1"])
+    if xmid < xlim[0]:
+        xmid += 1.0
+    if xmid > xlim[1]:
+        xmid -= 1.0
+
+    ax.annotate(
+        "",
+        xy=(xmid, 0.0), xytext=(xmid, ef_shift),
+        arrowprops=dict(arrowstyle="<->", linewidth=2.6, color="black")
+    )
+    ax.text(xmid + 0.06, 0.5 * ef_shift, f"$\\Phi$ = {phi:.3f} eV",
+            fontsize=14, color="#d8a14a")
+
+    style_like_example(ax)
+
+    ymin = min(v_shift.min(), ef_shift) - 1.0
+    ymax = max(v_shift.max(), 0.0) + 1.0
+    ax.set_ylim(ymin, ymax)
+
+    fig.tight_layout()
+    out_png = Path(f"{args.prefix}_WF_style.png")
+    fig.savefig(out_png, dpi=300)
+    print(f"[OK] Wrote: {out_png.resolve()}")
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
